@@ -3,7 +3,7 @@
 <div align="center">
 
 **Zero-Cloud-Egress Enterprise Document Q&A Engine**  
-*Local LLM (Qwen) · Hybrid Vector Index · Strict Source Attribution · Zero-Hallucination Guard*
+*Local LLM (Qwen) · Dependency-free Japanese n-gram retrieval · Strict Source Attribution · Refusal Guard*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://python.org)
@@ -29,23 +29,30 @@ In corporate environments handling confidential agreements (NDAs), HR policies, 
 ## 2. Architecture
 
 ```text
-[Enterprise PDFs / TXTs]
+[TXT / Markdown documents]
         │
-        ▼ (Character-Aware Japanese Chunker)
-[Document Chunks] ──► [Local Hybrid Vector Store]
+        ▼ (article-aware Japanese chunker: 第N条 / numbered / ■ headings)
+[Document chunks] ──► [In-memory lexical index: IDF-weighted character 2/3-grams]
                                  │
-   [User Query] ─────────────────┤ (Bigram Lexical + Vector Match)
+   [User query] ─────────────────┤
                                  ▼
-                     [Top-K Grounded Excerpts]
+                     [Top-3 passages + score]
                                  │
-                         (Threshold Check)
-                         ├─ < 0.25 ──► [Explicit Refusal / Out-of-Scope]
-                         │
-                         └─ >= 0.25 ──► [Local Qwen LLM (Temp=0.0)]
-                                             │
-                                             ▼
-                                 [Structured Answer + Verifiable Citation]
+                 score < 0.03 ──►┤──► [Refusal]
+                                 ▼
+              [Local Qwen via llama-server, temperature 0]
+              answers only from the numbered passages and cites one,
+              or replies 「該当なし」 ──► [Refusal]
+                                 │
+                                 ▼
+                [Answer + cited document + verbatim excerpt]
 ```
+
+Retrieval is deliberately simple and dependency-free (no embeddings): character n-grams
+work for Japanese without a tokenizer. The relevance decision is made by the local LLM, because
+no lexical score separates in-scope from out-of-scope questions reliably. If no LLM is reachable,
+the engine returns the best passage verbatim (`mode="extractive"`) when its score is at least 0.10,
+and refuses otherwise.
 
 ---
 
@@ -55,7 +62,8 @@ In corporate environments handling confidential agreements (NDAs), HR policies, 
 ```bash
 git clone https://github.com/korekiyo2003-stack/Local-RAG-DocQA.git
 cd Local-RAG-DocQA
-pip install -r requirements.txt
+# Python 3.10+ standard library only; for answers, run any OpenAI-compatible
+# local server on http://127.0.0.1:8080/v1 (e.g. llama-server with Qwen)
 ```
 
 ### Run Automated Verification Suite
@@ -63,26 +71,26 @@ pip install -r requirements.txt
 python tests/test_rag.py
 ```
 
-Sample output:
+Sample output (Qwen on llama-server, RTX 5070 Ti):
 ```text
-[Q1]: 返品は何日以内ですか？
-Answer: 商品受領日から14日以内です。
-Source: [01_返品ポリシー] 01_返品ポリシー.txt
-Confidence: 0.333 | Latency: 480ms
-
-[Q4 (Refusal Check)]: オフィスのフリードリンクはどこに置いてありますか？
-Answer: 社内規定および提供資料からは該当する情報を確認できませんでした。（推測防止のため回答を控えます）
-Source: — | Grounded: False
+[llm] 返品は何日以内ですか？
+  -> 商品受領日から14日以内です。
+  source=[01_返品ポリシー] 01_返品ポリシー.txt score=0.132 365.34ms
+[refused] 有給休暇は何日ありますか？
+  -> 社内規定および提供資料からは該当する情報を確認できませんでした。（推測防止のため回答を控えます）
+  source=— score=0.149 274.33ms
 ```
 
 ---
 
 ## 4. Verification & Testing Standards
 
-The repository includes a strict automated evaluation pipeline:
-1. **Factual Grounding**: Confirms numerical values and deadlines ("14日", "2営業日", "12,000円") match source clauses.
-2. **Refusal on Out-of-Domain Queries**: Tests that unrelated queries correctly fail the similarity gate and trigger zero-hallucination guard rails.
-3. **Sub-second Response Times**: Optimized token processing delivers answers under 600ms on modern local GPUs/CPUs.
+`tests/test_rag.py` checks, against the sample policies in `samples/docs`:
+1. **Grounding**: answers cite the right document and the excerpt holds the fact ("14日", "2営業日", "12,000円", "12文字", "役員以上").
+2. **Refusal**: questions the documents do not answer are refused, including one ("有給休暇は何日ありますか？") that scores higher lexically than a real question and only the LLM can reject.
+3. **Offline mode**: with no LLM reachable, the same questions get verbatim passages or a refusal.
+
+Measured latency with the LLM is 0.3–0.7 s per question on the machine above; it depends on your model and hardware.
 
 ---
 
