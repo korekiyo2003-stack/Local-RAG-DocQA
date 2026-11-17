@@ -43,7 +43,6 @@ python tests/test_rag.py
 ```
 4 つのサンプル規程への 6 問（回答・出典・拒否）、LLM でしか断れない範囲外の質問（:8080 で LLM が動いている場合）、
 同じ質問のオフライン動作、Word と PDF（ページ番号）、コマンドラインを確認します。
-GitHub Actions では LLM 以外の部分を Windows・macOS・Linux で毎回実行しています。
 
 実測（llama-server 上の Qwen、RTX 5070 Ti）: 1 問 0.3〜0.7 秒。
 

@@ -65,7 +65,7 @@ python tests/test_rag.py
 ```
 Six questions on four sample policies (answers, sources and one refusal), an out-of-scope question only
 the LLM can reject (run when an LLM is listening on :8080), the same questions offline, Word and PDF with page
-numbers, and the command line. GitHub Actions runs everything except the LLM pass on Windows, macOS and Linux.
+numbers, and the command line.
 
 Measured with Qwen on llama-server (RTX 5070 Ti): 0.3–0.7 s per question.
 
