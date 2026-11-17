@@ -14,6 +14,9 @@ import json
 import math
 import re
 import time
+import unicodedata
+import zipfile
+from xml.etree import ElementTree
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,11 +46,55 @@ class RagAnswer:
     grounded: bool
     latency_ms: float = 0.0
     mode: str = "llm"  # "llm", "extractive" (no LLM reachable) or "refused"
+    page: Optional[int] = None  # PDF page of the cited passage
+
+
+SUPPORTED = (".txt", ".md", ".docx", ".pdf")
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def extract_text(path: Path) -> List[Tuple[Optional[int], str]]:
+    """Return [(page or None, text)] for .txt/.md/.docx/.pdf. PDF needs `pip install pypdf`."""
+    suffix = path.suffix.lower()
+    if suffix in (".txt", ".md"):
+        raw = path.read_bytes()
+        for enc in ("utf-8-sig", "cp932"):
+            try:
+                return [(None, raw.decode(enc))]
+            except UnicodeDecodeError:
+                pass
+        raise ValueError(f"{path.name}: neither UTF-8 nor Shift-JIS")
+    if suffix == ".docx":
+        with zipfile.ZipFile(path) as z:
+            root = ElementTree.fromstring(z.read("word/document.xml"))
+        paragraphs = []
+        for para in root.iter(_W + "p"):
+            text = "".join(t.text or "" for t in para.iter() if t.tag in (_W + "t", _W + "tab"))
+            if text.strip():
+                paragraphs.append(text)
+        return [(None, "\n".join(paragraphs))]
+    if suffix == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError as e:
+            raise RuntimeError("PDF support needs pypdf: pip install pypdf") from e
+        pages = []
+        for number, page in enumerate(PdfReader(str(path)).pages, start=1):
+            # NFKC maps the Kangxi radicals PDF fonts often produce (⽉ U+2F49) back to normal kanji (月)
+            text = unicodedata.normalize("NFKC", page.extract_text() or "")
+            # Text extraction often splits Japanese lines mid-sentence; join lines that do not end a sentence
+            text = re.sub(r"(?<=[^。．！？」）)\n])\n(?=[^\s第■【#\d])", "", text)
+            if text.strip():
+                pages.append((number, text))
+        if not pages:
+            raise ValueError(f"{path.name}: no text layer (scanned PDF?). OCR it first.")
+        return pages
+    raise ValueError(f"unsupported file type: {path.name}")
 
 
 def extract_ngrams(text: str, sizes: Tuple[int, ...] = (2, 3)) -> set[str]:
     """Character n-grams with spaces and punctuation removed."""
-    cleaned = re.sub(r"[\s\W_]", "", text)
+    cleaned = re.sub(r"[\s\W_]", "", unicodedata.normalize("NFKC", text))
     grams: set[str] = set()
     for n in sizes:
         grams.update(cleaned[i:i + n] for i in range(len(cleaned) - n + 1))
@@ -63,7 +110,8 @@ class LexicalStore:
         self._grams: List[set[str]] = []
         self._df: Dict[str, int] = {}
 
-    def add_document(self, doc_id: str, title: str, text: str, chunk_size: int = 240, overlap: int = 40) -> int:
+    def add_document(self, doc_id: str, title: str, text: str, chunk_size: int = 240, overlap: int = 40,
+                     page: Optional[int] = None) -> int:
         if overlap >= chunk_size:
             raise ValueError("overlap must be smaller than chunk_size")
         lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -93,7 +141,7 @@ class LexicalStore:
                 if start > 0:
                     segment = header + "\n…" + segment
                 self._add_chunk(DocumentChunk(doc_id=doc_id, title=title, chunk_id=added, content=segment,
-                                              metadata={"section": s_idx, "offset": start}))
+                                              metadata={"section": s_idx, "offset": start, "page": page}))
                 added += 1
                 if end >= len(sec):
                     break
@@ -137,25 +185,32 @@ class LocalRagEngine:
     Talks to a local OpenAI-compatible server (llama-server, vLLM, Ollama) at `endpoint`.
     """
 
-    def __init__(self, endpoint: str = "http://127.0.0.1:8080/v1", model_name: str = "qwen3.8-27b",
+    def __init__(self, endpoint: Optional[str] = "http://127.0.0.1:8080/v1", model_name: str = "qwen3.8-27b",
                  min_score: float = 0.03, offline_min_score: float = 0.10, top_k: int = 3, timeout: float = 30.0):
-        self.endpoint = endpoint.rstrip("/")
+        self.endpoint = endpoint.rstrip("/") if endpoint else None  # None = never call an LLM
         self.model_name = model_name
         self.min_score = min_score                  # below this nothing is even sent to the LLM
         self.offline_min_score = offline_min_score  # stricter bar when no LLM can judge relevance
         self.top_k = top_k
         self.timeout = timeout
         self.store = LexicalStore()
+        self.skipped: List[str] = []  # files that could not be read, with the reason
 
-    def load_directory(self, folder: str | Path) -> int:
+    def load_directory(self, folder: str | Path, recursive: bool = True) -> int:
+        """Index every .txt/.md/.docx/.pdf under folder (or a single file). Unreadable files go to self.skipped."""
         path = Path(folder)
         if not path.exists():
-            return 0
+            raise FileNotFoundError(path)
+        files = [path] if path.is_file() else sorted((path.rglob("*") if recursive else path.glob("*")))
         total_chunks = 0
-        for f in sorted(path.glob("*.*")):
-            if f.suffix.lower() in (".txt", ".md"):
-                text = f.read_text(encoding="utf-8-sig")
-                total_chunks += self.store.add_document(doc_id=f.stem, title=f.name, text=text)
+        for f in files:
+            if not f.is_file() or f.suffix.lower() not in SUPPORTED or f.name.startswith("~$"):
+                continue
+            try:
+                for page, text in extract_text(f):
+                    total_chunks += self.store.add_document(doc_id=f.stem, title=f.name, text=text, page=page)
+            except (ValueError, RuntimeError, zipfile.BadZipFile, KeyError, ElementTree.ParseError) as e:
+                self.skipped.append(f"{f.name}: {e}")
         return total_chunks
 
     def _refuse(self, question: str, score: float, t0: float) -> RagAnswer:
@@ -164,9 +219,11 @@ class LocalRagEngine:
                          latency_ms=round((time.time() - t0) * 1000, 2), mode="refused")
 
     def _answer(self, question: str, text: str, chunk: DocumentChunk, score: float, t0: float, mode: str) -> RagAnswer:
-        return RagAnswer(question=question, answer=text, source_title=f"[{chunk.doc_id}] {chunk.title}",
+        page = chunk.metadata.get("page")
+        return RagAnswer(question=question, answer=text,
+                         source_title=f"[{chunk.doc_id}] {chunk.title}" + (f" p.{page}" if page else ""),
                          source_chunk_id=chunk.chunk_id, excerpt=chunk.content, confidence=round(score, 3),
-                         grounded=True, latency_ms=round((time.time() - t0) * 1000, 2), mode=mode)
+                         grounded=True, latency_ms=round((time.time() - t0) * 1000, 2), mode=mode, page=page)
 
     def query(self, question: str) -> RagAnswer:
         t0 = time.time()
@@ -202,6 +259,8 @@ class LocalRagEngine:
         return (answer or None), source_no
 
     def _call_local_llm(self, question: str, passages: List[str]) -> Optional[str]:
+        if not self.endpoint:
+            return None
         numbered = "\n\n".join(f"[{i}]\n{p}" for i, p in enumerate(passages, start=1))
         payload = {
             "model": self.model_name,

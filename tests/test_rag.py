@@ -54,13 +54,51 @@ def run_tests():
         print("\n(no LLM on 127.0.0.1:8080, skipping the LLM pass)")
 
     print("\n=== Offline extractive mode ===")
-    offline = LocalRagEngine(endpoint="http://127.0.0.1:9/v1", timeout=2)  # nothing listens on port 9
+    offline = LocalRagEngine(endpoint=None)  # never calls an LLM
     offline.load_directory(DOCS)
     for q, doc, fact in CASES:
         a = check(offline, q, doc, fact)
         assert a.mode in ("extractive", "refused")
 
+    run_format_tests()
+    run_cli_tests()
     print("\n>>> ALL RAG TESTS PASSED <<<")
+
+
+def run_format_tests():
+    """Word is read with the standard library; PDF needs pypdf and is skipped (and reported) without it."""
+    print("\n=== Word / PDF ===")
+    eng = LocalRagEngine(endpoint=None)
+    eng.load_directory(DOCS.parent / "formats")
+    a = check(eng, "育児休業の申出はいつまでに行いますか？", "05_育児休業規程", "1か月前")
+    assert a.page is None
+    try:
+        import pypdf  # noqa: F401
+    except ImportError:
+        assert any("pypdf" in s for s in eng.skipped), eng.skipped
+        print("(pypdf not installed: the PDF was skipped and reported)")
+        return
+    assert not eng.skipped, eng.skipped
+    a = check(eng, "在宅勤務手当は月額いくらですか？", "06_リモートワーク規程", "3,000円")
+    assert a.page == 2 and a.source_title.endswith("p.2"), a.source_title
+    a = check(eng, "在宅勤務は週何日までですか？", "06_リモートワーク規程", "週3日")
+    assert a.page == 1
+
+
+def run_cli_tests():
+    import json
+    import os
+    import subprocess
+    root = Path(__file__).resolve().parent.parent
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    run = lambda *a: subprocess.run([sys.executable, str(root / "ask.py"), *a], capture_output=True,  # noqa: E731
+                                    text=True, encoding="utf-8", env=env)
+    r = run(str(DOCS), "返品は何日以内ですか？", "--offline", "--json")
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout)
+    assert out["grounded"] and "14日" in out["excerpt"] and out["mode"] == "extractive"
+    assert run(str(root / "nope")).returncode == 2
+    print("CLI ok")
 
 
 if __name__ == "__main__":
