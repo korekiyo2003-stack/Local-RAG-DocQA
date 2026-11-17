@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/cover.png" alt="Local-RAG-DocQA" width="100%"></p>
+
 # Local-RAG-DocQA: On-Premise Document Intelligence
 
 <div align="center">

@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/cover.png" alt="Local-RAG-DocQA" width="100%"></p>
+
 # Local-RAG-DocQA: ローカル文書検索＆高精度質問応答システム
 
 <div align="center">
